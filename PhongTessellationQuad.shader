@@ -9,6 +9,8 @@
 // Tessellation introduction https://nedmakesgames.medium.com/mastering-tessellation-shaders-and-their-many-uses-in-unity-9caeb760150e
 // Tessellation factor semantics, useful for quads : https://www.reedbeta.com/blog/tess-quick-ref/
 // Projection matrices https://jsantell.com/3d-projection/
+// Archived reference https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#HullShader
+// Good practices from nvidia https://developer.download.nvidia.com/whitepapers/2010/PN-AEN-Triangles-Whitepaper.pdf
 
 // Phong strategy, for an edge :
 // Edge P0P1 with normals n0 n1, and x barycentric coordinate (x=0 -> p0, x=1 -> p1)
@@ -76,7 +78,7 @@ Shader "Custom/PhongTessellationQuad"
             #pragma shader_feature_local _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
 
             #pragma vertex vertex_stage
-            #pragma hull hull_stage
+            #pragma hull hull_control_point_stage
             #pragma domain domain_stage
             #pragma fragment fragment_stage
 
@@ -89,7 +91,7 @@ Shader "Custom/PhongTessellationQuad"
 
             // Types
 
-            struct VertexAttributes {
+            struct VertexData {
                 float3 position_os : POSITION;
                 float3 normal_os : NORMAL;
                 float2 uv : TEXCOORD0;
@@ -99,23 +101,32 @@ Shader "Custom/PhongTessellationQuad"
                 UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
-            struct TessellationFactors {
-                float edge[4] : SV_TessFactor;
-                float inside[2] : SV_InsideTessFactor;
-            };
-
-            struct TessellationControlPoint {
-                float3 position_os : INTERNALTESSPOS;
+            struct TessellationVertexData {
+                float3 position_os : CP_POSITION;
                 float3 normal_os : NORMAL;
                 float2 uv : TEXCOORD0;
-                float4 position_cs : TEXCOORD1; // For pre-tessellation culling only
 
                 #if _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
-                float3 phong_normal_os : TEXCOORD2;
+                float3 phong_normal_os : NORMAL1;
                 #else
                 #define phong_normal_os normal_os
                 #endif
+
+                bool is_culled : CULLING_STATUS; // Early culling test (before tessellation) combines per-vertex values computed here
+
                 UNITY_VERTEX_INPUT_INSTANCE_ID
+            };
+
+            struct TessellationControlPoint {
+                TessellationVertexData vertex;
+                // Compute edge-related data in parallel, for edge(vertex[i], vertex[i+1 mod 4])
+                float edge_factor : EDGE_TESSELLATION_FACTOR;
+            };
+
+            struct TessellationFactors {
+                float edge[4] : SV_TessFactor; // Edge association [u=0, v=0, u=1, v=1]
+                float inside[2] : SV_InsideTessFactor; // Axis [u,v]
+                // Vertex ordering is thus chosen as [(0, 1), (0, 0), (1, 0), (1, 1)] in (u,v coordinates)
             };
 
             struct Interpolators {
@@ -126,7 +137,6 @@ Shader "Custom/PhongTessellationQuad"
                 fixed3 ambient : COLOR1;
                 SHADOW_COORDS(2)
 
-                UNITY_VERTEX_INPUT_INSTANCE_ID
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -143,8 +153,19 @@ Shader "Custom/PhongTessellationQuad"
 
             // stages
 
-            TessellationControlPoint vertex_stage (VertexAttributes input) {
-                TessellationControlPoint output;
+            static float3 camera_os = mul (unity_WorldToObject, float4 (_WorldSpaceCameraPos, 1)).xyz;
+
+            bool in_frustum (float4 position_cs) {
+                // pos.xyz/pos.w in cube (-1, -1, -1)*(1,1,1)
+                float w = position_cs.w * 1.3; // Tolerance
+                return all (abs (position_cs.xyz) <= abs (w));
+            }
+            bool surface_faces_camera (const VertexData vertex) {
+                return dot (vertex.normal_os, vertex.position_os - camera_os) < 0;
+            }
+
+            TessellationVertexData vertex_stage (const VertexData input) {
+                TessellationVertexData output;
 
                 UNITY_SETUP_INSTANCE_ID (input);
                 UNITY_TRANSFER_INSTANCE_ID(input, output);
@@ -152,14 +173,16 @@ Shader "Custom/PhongTessellationQuad"
                 output.position_os = input.position_os;
                 output.normal_os = input.normal_os;
                 output.uv = TRANSFORM_TEX (input.uv, _MainTexture);
-                output.position_cs = UnityObjectToClipPos (input.position_os);
+
                 #if _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
                 output.phong_normal_os = input.phong_normal_encoded_os * 2. - 1.;
                 #endif
+
+                output.is_culled = !surface_faces_camera (input) || !in_frustum (UnityObjectToClipPos (input.position_os));
                 return output;
             }
 
-            float edge_tessellation_factor (TessellationControlPoint p0, TessellationControlPoint p1) {
+            float edge_tessellation_factor (const TessellationVertexData p0, const TessellationVertexData p1) {
                 float3 p0p1_os = p1.position_os - p0.position_os;
                 float3 d01_os = dot (p0p1_os, p1.phong_normal_os) * p1.phong_normal_os - dot (p0p1_os, p0.phong_normal_os) * p0.phong_normal_os;
                 float3 center_p0p1_os = 0.5 * (p0.position_os + p1.position_os);
@@ -191,76 +214,64 @@ Shader "Custom/PhongTessellationQuad"
                 return clamp (tessellation_level, 1, 64);
             }
 
-            bool in_frustum (float4 position_cs) {
-                // pos.xyz/pos.w in cube (-1, -1, -1)*(1,1,1)
-                float w = position_cs.w * 1.3; // Tolerance
-                return all (abs (position_cs.xyz) <= abs (w));
-            }
-
-            static float3 camera_os = mul (unity_WorldToObject, float4 (_WorldSpaceCameraPos, 1)).xyz;
-
-            TessellationFactors hull_constants (InputPatch<TessellationControlPoint, 4> patch) {
-                UNITY_SETUP_INSTANCE_ID (patch[0]);
-
-                // Early culling : discard quads entirely out of frustum of facing backwards
-                bool4 patch_in_frustum;
-                float4 dot_eye_dir;
-                [unroll] for (int i = 0; i < 4; ++i) {
-                    patch_in_frustum[i] = in_frustum (patch[i].position_cs); // Sadly fails with long faces crossing camera
-                    dot_eye_dir[i] = dot (patch[i].normal_os, patch[i].position_os - camera_os); // >0 if facing away from camera
-                }
-                if (!any (patch_in_frustum) || all (dot_eye_dir > 0)) {
-                    return (TessellationFactors) 0;
-                }
-
-                TessellationFactors factors;
-                factors.edge[0] = edge_tessellation_factor (patch[3], patch[0]);
-                factors.edge[1] = edge_tessellation_factor (patch[0], patch[1]);
-                factors.edge[2] = edge_tessellation_factor (patch[1], patch[2]);
-                factors.edge[3] = edge_tessellation_factor (patch[2], patch[3]);
-                
-                factors.inside[0] = max (factors.edge[1], factors.edge[3]);
-                factors.inside[1] = max (factors.edge[0], factors.edge[2]);
-                return factors;
-            }
-
             [domain ("quad")]
             [outputcontrolpoints (4)]
             [outputtopology ("triangle_cw")]
-            [patchconstantfunc ("hull_constants")]
+            [patchconstantfunc ("hull_patch_constant_stage")]
             [partitioning ("fractional_odd")]
-            TessellationControlPoint hull_stage (InputPatch<TessellationControlPoint, 4> patch, uint id : SV_OutputControlPointID) {
-                return patch[id];
+            TessellationControlPoint hull_control_point_stage (const InputPatch<TessellationVertexData, 4> vertex, uint id0 : SV_OutputControlPointID) {
+                TessellationControlPoint output;
+                output.vertex = vertex[id0];
+
+                // Compute additional edge values in parallel
+                uint id1 = id0 < 3 ? id0 + 1 : 0; // (id0 + 1) mod 4
+                output.edge_factor = edge_tessellation_factor (vertex[id0], vertex[id1]); 
+                return output;
             }
 
-            #define PATCH_BARYCENTER(patch, accessor) lerp (lerp (patch[0] accessor, patch[1] accessor, uv.x), lerp (patch[3] accessor, patch[2] accessor, uv.x), uv.y)
+            TessellationFactors hull_patch_constant_stage (const OutputPatch<TessellationControlPoint, 4> cp) {
+                TessellationFactors factors;
+                
+                if (cp[0].vertex.is_culled && cp[1].vertex.is_culled && cp[2].vertex.is_culled && cp[3].vertex.is_culled) {
+                    // Early culling : discard quads entirely out of frustum or facing backwards
+                    factors = (TessellationFactors) 0;
+                } else {
+                    [unroll] for (int i = 0; i < 4; ++i) {
+                        factors.edge[i] = cp[i].edge_factor;
+                    }
+                    factors.inside[0] = max (cp[1].edge_factor, cp[3].edge_factor);
+                    factors.inside[1] = max (cp[0].edge_factor, cp[2].edge_factor);
+                }
+                return factors;
+            }
 
-            float3 phong_projection_displacement (float3 linear_interpolation_os, TessellationControlPoint p) {
+            #define UV_BARYCENTER(cp, accessor) lerp (lerp (cp[1] accessor, cp[2] accessor, uv.x), lerp (cp[0] accessor, cp[3] accessor, uv.x), uv.y)
+
+            float3 phong_projection_displacement (float3 linear_interpolation_os, const TessellationVertexData p) {
                 // Projection operator : pi(q, p_i, n) = q - dot(q - p_i, n) n, but just extract the displacement
                 return dot (p.position_os - linear_interpolation_os, p.phong_normal_os) * p.phong_normal_os;
             }
 
             [domain ("quad")]
-            Interpolators domain_stage (TessellationFactors factors, OutputPatch<TessellationControlPoint, 4> patch, float2 uv : SV_DomainLocation) {
+            Interpolators domain_stage (const TessellationFactors factors, const OutputPatch<TessellationControlPoint, 4> cp, float2 uv : SV_DomainLocation) {
                 Interpolators output;
 
-                UNITY_SETUP_INSTANCE_ID (patch[0]);
-                UNITY_TRANSFER_INSTANCE_ID(patch[0], output);
+                UNITY_SETUP_INSTANCE_ID (cp[0].vertex);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
 
                 // Phong vertex displacement
-                float3 linear_interpolation_os = PATCH_BARYCENTER (patch, .position_os);
+                float3 linear_interpolation_os = UV_BARYCENTER (cp, .vertex.position_os);
                 float3 phong_displacements[4];
                 [unroll] for (int i = 0; i < 4; ++i) {
-                    phong_displacements[i] = phong_projection_displacement (linear_interpolation_os, patch[i]);
+                    phong_displacements[i] = phong_projection_displacement (linear_interpolation_os, cp[i].vertex);
                 }
-                float3 phong_displacement = PATCH_BARYCENTER (phong_displacements, +0);
+                float3 phong_displacement = UV_BARYCENTER (phong_displacements, +0);
                 float3 position_os = linear_interpolation_os + _TSL_Phong * phong_displacement;
 
                 // Classic vertex stage transformations
                 output.pos = UnityObjectToClipPos (position_os);
-                float3 normal_os = PATCH_BARYCENTER (patch, .normal_os);
-                output.uv = PATCH_BARYCENTER (patch, .uv);
+                float3 normal_os = UV_BARYCENTER (cp, .vertex.normal_os);
+                output.uv = UV_BARYCENTER (cp, .vertex.uv);
 
                 // Shading
                 float3 normal_ws = UnityObjectToWorldNormal (normal_os);
@@ -272,7 +283,6 @@ Shader "Custom/PhongTessellationQuad"
             }
 
             fixed4 fragment_stage (Interpolators input) : SV_Target {
-                UNITY_SETUP_INSTANCE_ID (input);
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX (input);
 
                 // TODO lighting
