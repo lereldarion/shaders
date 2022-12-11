@@ -1,57 +1,31 @@
 ﻿// Goal : tessellate only to useful places : curved, on the side, large.
 // Use Phong to smooth geometry. Instead of triangles, use it on quads, it generates less artifacts.
 
-// TODO modularize to reuse phong in shadowcaster
+// TODO improve bezier computation with offsets to linear interpolation instead ?
+// TODO general optimization
+// TODO modularize to reuse pn in shadowcaster
 // TODO use real lighting, standard or something else
 
 // Useful links :
-// Quad phong tessellation https://liris.cnrs.fr/Documents/Liris-6161-phong_tess.pdf
+// https://www.cise.ufl.edu/research/SurfLab/papers/1008PNquad.pdf
 // Tessellation introduction https://nedmakesgames.medium.com/mastering-tessellation-shaders-and-their-many-uses-in-unity-9caeb760150e
 // Tessellation factor semantics, useful for quads : https://www.reedbeta.com/blog/tess-quick-ref/
 // Projection matrices https://jsantell.com/3d-projection/
 // Archived reference https://microsoft.github.io/DirectX-Specs/d3d/archive/D3D11_3_FunctionalSpec.htm#HullShader
 // Good practices from nvidia https://developer.download.nvidia.com/whitepapers/2010/PN-AEN-Triangles-Whitepaper.pdf
 
-// Phong strategy, for an edge :
+// PN strategy, for an edge :
 // Edge P0P1 with normals n0 n1, and x barycentric coordinate (x=0 -> p0, x=1 -> p1)
 // p0 ------- p1 -> x
 //  \         /
 //  n0       n1
 // We assume p0 to be at the origin for simplicity.
-//
-// The phong interpolated curve can be rewritten as :
-// P(x) = x P0P1 + x(1-x) D01, with D01 = dot(P0P1, n1) n1 - dot(P0P1, n0) n0
-// Meanwhile the linear interpolation is I(x) = x P0P1
-// The distance ("error") between edge and P is thus E(x) = x(1-x) D01
-// The maximum is at x=0.5 (expected), with value max E = 0.25 D01
-// This error vector can be projected onto whatever space is meaninful for creating a criteria, and Phong mixing factor added onto it.
-//
-// No we perform a tessellation of factor n, cutting the edge in n edges between points P(k/n) on the curve P.
-// The k-th edge between P(k/n) and P((k+1)/n) has the following formula, for k/n <= x <= (k+1)/n :
-// I^k(x) = x P0P1 + (x (1-(2k+1)/n) + k(k+1)/n^2) D01
-// Thus the error vector is : E^k(x) = (-x^2 + x(2k+1)/n - k(k+1)/n^2) D01
-// The maximum is at x = k/n + 1/(2n), again expected. Value is max E^k = 1/(4n^2) D01 !
-// This is not dependent on k, and has a very simple form useful to choose n to match a requested precision.
 
-// The last step is the precision metric, ie how to project D01 to "human perception precision".
-//
-// First idea was to project D01 in screenspace and target a 1 pixel precision :
-//   float2 screen_position_z_clamped (float3 position_os) {
-//       // Go to clip space, which is view space normalised in xy and with depth in w
-//       float4 position_cs = ComputeScreenPos (UnityObjectToClipPos (position_os));
-//       float near_plane = _ProjectionParams.y;
-//       float depth = max (position_cs.w, near_plane); // Prevent spike in tessellation if depth is near focal point
-//       return position_cs.xy / depth * _ScreenParams.xy;
-//   }
-//   float error_ss_length = distance (screen_position_z_clamped (center_p0p1_os), screen_position_z_clamped (max_phong_os));
-//   float tessellation_level = sqrt (error_ss_length / pixel_precision);
-// Good results but some spike in tessellation when projection ends up on the z=0 plane in view space.
-//
 // The current system uses angular size of D01 on the screen.
 // This has similar quality, is cheaper to compute, and singularity is only a point.
 // Angular precision is inferred to reach 1 pixel at screen center.
 
-Shader "Custom/PhongTessellationQuad"
+Shader "Custom/PnQuadTessellation"
 {
     Properties {
         [Header (Standard Shader Parameters)]
@@ -59,8 +33,7 @@ Shader "Custom/PhongTessellationQuad"
         _MainTexture ("Albedo (RGB)", 2D) = "white" {}
 
         [Header (Tessellation)]
-        _TSL_Phong ("Phong coefficient", Range (0, 1)) = 0.5
-        [Toggle (_TSL_PHONG_NORMALS_IN_VERTEX_COLOR)] _TSL_Phong_Normals_In_Vertex_Color ("Use normals in vertex Color", Float) = 0
+        [Toggle (_TSL_PN_NORMALS_IN_VERTEX_COLOR)] _TSL_PN_Normals_In_Vertex_Color ("Use normals in vertex Color", Float) = 0
     }
     SubShader {
         Tags {
@@ -75,7 +48,7 @@ Shader "Custom/PhongTessellationQuad"
             CGPROGRAM
             #pragma target 5.0
             #pragma multi_compile_instancing
-            #pragma shader_feature_local _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
+            #pragma shader_feature_local _TSL_PN_NORMALS_IN_VERTEX_COLOR
 
             #pragma vertex vertex_stage
             #pragma hull hull_control_point_stage
@@ -95,8 +68,8 @@ Shader "Custom/PhongTessellationQuad"
                 float3 position_os : POSITION;
                 float3 normal_os : NORMAL;
                 float2 uv : TEXCOORD0;
-                #if _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
-                float3 phong_normal_encoded_os : COLOR;
+                #if _TSL_PN_NORMALS_IN_VERTEX_COLOR
+                float3 pn_normal_encoded_os : COLOR;
                 #endif
                 UNITY_VERTEX_INPUT_INSTANCE_ID
             };
@@ -106,10 +79,10 @@ Shader "Custom/PhongTessellationQuad"
                 float3 normal_os : NORMAL;
                 float2 uv : TEXCOORD0;
 
-                #if _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
-                float3 phong_normal_os : NORMAL1;
+                #if _TSL_PN_NORMALS_IN_VERTEX_COLOR
+                float3 pn_normal_os : NORMAL1;
                 #else
-                #define phong_normal_os normal_os
+                #define pn_normal_os normal_os
                 #endif
 
                 bool is_culled : CULLING_STATUS; // Early culling test (before tessellation) combines per-vertex values computed here
@@ -121,12 +94,21 @@ Shader "Custom/PhongTessellationQuad"
                 TessellationVertexData vertex;
                 // Compute edge-related data in parallel, for edge(vertex[i], vertex[i+1 mod 4])
                 float edge_factor : EDGE_TESSELLATION_FACTOR;
+                float3 b01_os : EDGE_B01;
+                float3 b10_os : EDGE_B10;
             };
 
             struct TessellationFactors {
                 float edge[4] : SV_TessFactor; // Edge association [u=0, v=0, u=1, v=1]
                 float inside[2] : SV_InsideTessFactor; // Axis [u,v]
                 // Vertex ordering is thus chosen as [(0, 1), (0, 0), (1, 0), (1, 1)] in (u,v coordinates)
+                // v             e3
+                // ↑  b0  -- b03 -- b30 -- b3
+                //    b01 -- b02 -- b31 -- b32 e2
+                // e0 b10 -- b13 -- b20 -- b23
+                //    b1  -- b12 -- b21 -- b2
+                //               e1            -> u
+                float3 interior_b_os[4] : INTERIOR_B; // b02, b13, b20, b31
             };
 
             struct Interpolators {
@@ -146,8 +128,6 @@ Shader "Custom/PhongTessellationQuad"
             uniform float4 _MainTexture_ST; uniform float4 _MainTexture_TexelSize;
 
             uniform fixed4 _Color;
-
-            uniform float _TSL_Phong;
 
             static const float pixel_precision = 1;
 
@@ -174,8 +154,8 @@ Shader "Custom/PhongTessellationQuad"
                 output.normal_os = input.normal_os;
                 output.uv = TRANSFORM_TEX (input.uv, _MainTexture);
 
-                #if _TSL_PHONG_NORMALS_IN_VERTEX_COLOR
-                output.phong_normal_os = input.phong_normal_encoded_os * 2. - 1.;
+                #if _TSL_PN_NORMALS_IN_VERTEX_COLOR
+                output.pn_normal_os = input.pn_normal_encoded_os * 2. - 1.;
                 #endif
 
                 output.is_culled = !surface_faces_camera (input) || !in_frustum (UnityObjectToClipPos (input.position_os));
@@ -184,13 +164,13 @@ Shader "Custom/PhongTessellationQuad"
 
             float edge_tessellation_factor (const TessellationVertexData p0, const TessellationVertexData p1) {
                 float3 p0p1_os = p1.position_os - p0.position_os;
-                float3 d01_os = dot (p0p1_os, p1.phong_normal_os) * p1.phong_normal_os - dot (p0p1_os, p0.phong_normal_os) * p0.phong_normal_os;
+                float3 d01_os = dot (p0p1_os, p1.pn_normal_os) * p1.pn_normal_os - dot (p0p1_os, p0.pn_normal_os) * p0.pn_normal_os;
                 float3 center_p0p1_os = 0.5 * (p0.position_os + p1.position_os);
 
                 // Measure angular size of max phong displacement from camera viewpoint.
                 // Easier in view space, but world space is cheaper. World to view space should have uniform scaling.
                 float3 eye_to_center_p0p1_ws = mul (unity_ObjectToWorld, float4 (center_p0p1_os, 1)).xyz - _WorldSpaceCameraPos;
-                float3 max_phong_ws = mul ((float3x3) unity_ObjectToWorld, 0.25 * _TSL_Phong * d01_os); // Vector, not position, so ignore translations
+                float3 max_phong_ws = mul ((float3x3) unity_ObjectToWorld, 0.25 * 0.5 * d01_os); // Vector, not position, so ignore translations
 
                 // Approximate angle by using tan(angle) = |max_phong projected on eye dir plane| / eye_distance
                 // A previous strategy was to use cross(eye_dir_to_a, eye_dir_to_b) to compute sin of angle, but this was 10% more math cost.
@@ -214,18 +194,67 @@ Shader "Custom/PhongTessellationQuad"
                 return clamp (tessellation_level, 1, 64);
             }
 
+            float3 project_on_tangent_plane_to_normal (float3 vec, float3 normal) {
+                return vec - dot (vec, normal) * normal;
+            }
+            float dist2 (float3 v) { return dot (v, v); }
+
             [domain ("quad")]
             [outputcontrolpoints (4)]
             [outputtopology ("triangle_cw")]
             [patchconstantfunc ("hull_patch_constant_stage")]
-            [partitioning ("fractional_odd")]
+            [partitioning ("integer")]
             TessellationControlPoint hull_control_point_stage (const InputPatch<TessellationVertexData, 4> vertex, uint id0 : SV_OutputControlPointID) {
                 TessellationControlPoint output;
-                output.vertex = vertex[id0];
+                const TessellationVertexData v0 = vertex[id0];
+                UNITY_SETUP_INSTANCE_ID (v0);
+                output.vertex = v0;
 
-                // Compute additional edge values in parallel
+                // Compute edge values in parallel
                 uint id1 = id0 < 3 ? id0 + 1 : 0; // (id0 + 1) mod 4
-                output.edge_factor = edge_tessellation_factor (vertex[id0], vertex[id1]); 
+                const TessellationVertexData v1 = vertex[id1];
+
+                // Bezier control points along i,i+1 edge
+                float3 p0p1_os = v1.position_os - v0.position_os;
+                float3 third_p0p1_os = p0p1_os / 3.;
+                output.b01_os = v0.position_os + project_on_tangent_plane_to_normal (third_p0p1_os, v0.pn_normal_os);
+                output.b10_os = v1.position_os + project_on_tangent_plane_to_normal (-third_p0p1_os, v1.pn_normal_os);
+
+                // camera --z-- 0 <- center of screen
+                //        `a--- x <- x world space coord, target is pixel_precision px on the screen
+                // World space angle a small => sin a = tan a = a = x / z = angle_precision
+                // Projection + divide + ComputeScreenPos(uv) + to_pixel : x * proj[0][0] * (1 / z) * (0.5 * unity_StereoScaleOffset.x) * ScreenParams.x = pixel_precision
+                #if UNITY_SINGLE_PASS_STEREO
+                float scale_offset = unity_StereoScaleOffset[unity_StereoEyeIndex].x;
+                #else
+                float scale_offset = 1;
+                #endif
+                float angle_precision = pixel_precision / (unity_CameraProjection[0][0] * 0.5 * scale_offset * _ScreenParams.x);
+
+                // Tessellation factor
+                float3 center_p0p1_os = 0.5 * (v0.position_os + v1.position_os);
+                float3 eye_dir_ws = mul (unity_ObjectToWorld, float4 (center_p0p1_os, 1)).xyz - _WorldSpaceCameraPos;
+
+                float3 ev0_ws = dot (-p0p1_os, v0.pn_normal_os) * mul ((float3x3) unity_ObjectToWorld, v0.pn_normal_os);
+                float3 ev1_ws = dot (p0p1_os, v1.pn_normal_os) * mul ((float3x3) unity_ObjectToWorld, v1.pn_normal_os);
+
+                float eye_dist2 = dist2 (eye_dir_ws);
+                float inv_eye_dist2 = 1. / eye_dist2;
+                float3 ev0_proj = ev0_ws - inv_eye_dist2 * dot (ev0_ws, eye_dir_ws) * eye_dir_ws;
+                float3 ev1_proj = ev1_ws - inv_eye_dist2 * dot (ev1_ws, eye_dir_ws) * eye_dir_ws;
+
+                float error_target2 = eye_dist2 * angle_precision * angle_precision;
+                float polynom_coeff_2 = (7. / 210.) * (dist2 (ev0_proj) - dot (ev0_proj, ev1_proj) + dist2 (ev1_proj));
+                float polynom_coeff_0 = (-5. / 210.) * dist2 (ev0_proj - ev1_proj);
+
+                float n = 1;
+                float n6 = 1;
+                while (n <= 63 && ((n * n) * polynom_coeff_2 + polynom_coeff_0) > (error_target2 * n6)) {
+                    n *= 2;
+                    n6 *= 64; // 2^6
+                }
+
+                output.edge_factor = n; //clamp (length (p0p1_os) / 0.2, 1, 64);
                 return output;
             }
 
@@ -236,21 +265,30 @@ Shader "Custom/PhongTessellationQuad"
                     // Early culling : discard quads entirely out of frustum or facing backwards
                     factors = (TessellationFactors) 0;
                 } else {
-                    [unroll] for (int i = 0; i < 4; ++i) {
+                    [unroll] for (uint i = 0; i < 4; ++i) {
                         factors.edge[i] = cp[i].edge_factor;
                     }
                     factors.inside[0] = max (cp[1].edge_factor, cp[3].edge_factor);
                     factors.inside[1] = max (cp[0].edge_factor, cp[2].edge_factor);
+
+                    // All edge b01/b10 are 3 times theirs values in pnquad paper formulas.
+                    float3 q = float3 (0, 0, 0);
+                    [unroll] for (i = 0; i < 4; ++i) {
+                        q += (cp[i].b01_os + cp[i].b10_os);
+                    }
+                    [unroll] for (i = 0; i < 4; ++i) {
+                        // div by 3 due to x3 premultiplication of edge factors
+                        float3 e_i = (1 / 9.) * (cp[i].b01_os + cp[(i + 3) % 4].b10_os + q) - (1. / 18.) * (cp[(i + 1) % 4].b10_os + cp[(i + 2) % 4].b01_os);
+                        // no div by 3 as vertex positions not premultiplied
+                        float3 v_i = (4. / 9.) * cp[i].vertex.position_os + (2. / 9.) * (cp[(i + 1) % 4].vertex.position_os + cp[(i + 3) % 4].vertex.position_os) + (1. / 9.) * cp[(i + 2) % 4].vertex.position_os;
+                        // 1.5 and 0.5 factors integrated in formulas of e_k and v_k, in addition to x9 premultiply
+                        factors.interior_b_os[i] = 2 * e_i - v_i;
+                    }
                 }
                 return factors;
             }
 
             #define UV_BARYCENTER(cp, accessor) lerp (lerp (cp[1] accessor, cp[2] accessor, uv.x), lerp (cp[0] accessor, cp[3] accessor, uv.x), uv.y)
-
-            float3 phong_projection_displacement (float3 linear_interpolation_os, const TessellationVertexData p) {
-                // Projection operator : pi(q, p_i, n) = q - dot(q - p_i, n) n, but just extract the displacement
-                return dot (p.position_os - linear_interpolation_os, p.phong_normal_os) * p.phong_normal_os;
-            }
 
             [domain ("quad")]
             Interpolators domain_stage (const TessellationFactors factors, const OutputPatch<TessellationControlPoint, 4> cp, float2 uv : SV_DomainLocation) {
@@ -259,18 +297,23 @@ Shader "Custom/PhongTessellationQuad"
                 UNITY_SETUP_INSTANCE_ID (cp[0].vertex);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
 
-                // Phong vertex displacement
-                float3 linear_interpolation_os = UV_BARYCENTER (cp, .vertex.position_os);
-                float3 phong_displacements[4];
-                [unroll] for (int i = 0; i < 4; ++i) {
-                    phong_displacements[i] = phong_projection_displacement (linear_interpolation_os, cp[i].vertex);
-                }
-                float3 phong_displacement = UV_BARYCENTER (phong_displacements, +0);
-                float3 position_os = linear_interpolation_os + _TSL_Phong * phong_displacement;
+                // PN vertex displacement
+                float4 muv_uv = float4 (1 - uv, uv);
+                float4 muv2_uv2 = muv_uv * muv_uv;
+                float4 mu3_umu2_u2mu_u3 = muv_uv.xzxz * muv2_uv2.xxzz; // (1-u)^3, u(1-u)^2, u^2(1-u), u^3
+                float4 mu3_3umu2_3u2mu_u3 = mu3_umu2_u2mu_u3 * float4 (1, 3, 3, 1);
+                float4 mv3_vmv2_v2mv_v3 = muv_uv.ywyw * muv2_uv2.yyww; // (1-v)^3, v(1-v)^2, v^2(1-v), v^3
+                float4 mv3_3vmv2_3v2mv_v3 = mv3_vmv2_v2mv_v3 * float4 (1, 3, 3, 1);
+                float4x4 f = mul (float4x1 (mv3_3vmv2_3v2mv_v3), float1x4 (mu3_3umu2_3u2mu_u3));
+
+                float3 position_os = f[3][0] * cp[0].vertex.position_os + f[3][1] * cp[3].b10_os + f[3][2] * cp[3].b01_os + f[3][3] * cp[3].vertex.position_os
+                + f[2][0] * cp[0].b01_os + f[2][1] * factors.interior_b_os[0] + f[2][2] * factors.interior_b_os[3] + f[2][3] * cp[2].b10_os
+                + f[1][0] * cp[0].b10_os + f[1][1] * factors.interior_b_os[1] + f[1][2] * factors.interior_b_os[2] + f[1][3] * cp[2].b01_os
+                + f[0][0] * cp[1].vertex.position_os + f[0][1] * cp[1].b01_os + f[0][2] * cp[1].b10_os + f[0][3] * cp[2].vertex.position_os;
 
                 // Classic vertex stage transformations
                 output.pos = UnityObjectToClipPos (position_os);
-                float3 normal_os = UV_BARYCENTER (cp, .vertex.normal_os);
+                float3 normal_os = UV_BARYCENTER (cp, .vertex.normal_os); // could do the quadratic version if motivated
                 output.uv = UV_BARYCENTER (cp, .vertex.uv);
 
                 // Shading
@@ -292,8 +335,7 @@ Shader "Custom/PhongTessellationQuad"
 
             ENDCG
         }
-
     }
-    
+
     Fallback "Diffuse" // FIXME use tesselation with lesser precision criteria ?
 }
