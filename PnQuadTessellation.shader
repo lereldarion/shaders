@@ -15,11 +15,44 @@
 // Good practices from nvidia https://developer.download.nvidia.com/whitepapers/2010/PN-AEN-Triangles-Whitepaper.pdf
 
 // PN strategy, for an edge :
-// Edge P0P1 with normals n0 n1, and x barycentric coordinate (x=0 -> p0, x=1 -> p1)
-// p0 ------- p1 -> x
+// Edge P0P1 with normals n0 n1, and t barycentric coordinate (t=0 -> p0, t=1 -> p1)
+// p0 ------- p1 -> t
 //  \         /
 //  n0       n1
-// We assume p0 to be at the origin for simplicity.
+//
+// PN patch is a 3rd degree bezier : P(u, v) = sum_{0 <= i,j <= 3} b_ij C(i, 3) (1-u)^(3-i) u^i C(j, 3) (1-v)^(3-j) v^j
+// With b_ij = Pi + 1/3 ((Pj - Pi) - dot (Pj - Pi, ni) ni)
+// On the 01 edge : P(t) = P0 (1-t)^3 + 3 b01 (1-t)^2 t + 3 b10 (1-t) t^2 + t^3 P1
+// Linear interpolation : I(t) = (1 - t) P0 + t P1.
+// Error E(t) = P(t)-I(t) = (1-t)t [(1-t) dot(P0 - P1, n0) n0 + t dot(P1 - P0, n1) n1 ]
+//
+// Compared to phong, we cannot split displacement vector from displacement factor.
+// Projection must be integrated before computing the maximum error.
+// c__________p
+//           /|
+//          E Ep = project(E on cp) on plane tangent to cp = "camera distance to edge" (in practice edge center).
+// Criterion is "max" theta = angle(p-c, Ep) ~ tan(angle) = length(Ep) / length (p - c)
+// project(v on cp) = v - dot(v, cp/length(cp)) cp/length(cp) = v - dot(v, cp) cp / cp^2 ; a linear operator for constant cp
+// So the final error criterion to estimate is (using the square to simplify things) :
+// theta(t)^2 = Ep^2 / cp^2 = (1-t)^2 t^2 [(1-t) v0 + t v1]^2, with v0 v1 constant vectors, v0 = dot(P0 - P1, n0) project(n0 on cp) / length(cp)
+//
+// We want to estimate the "caracteristic" size of theta^2.
+// max is annoying due to the need to solve a 3rd degree polynomial to find extremums.
+// Instead we use avg of squared norm along the edge : int_0^1 theta(t)^2 dt / 1
+//
+// Anguler error estimation for n levels of tessellation :
+// avg_theta_n^2 = sum_{0 <= k < n} int_{k/n <= t <= (k+1)/n} theta_kn(t)^2 dt
+// With theta_kn(t) = length(project(E_kn(t) on cp)) / cp, with E_kn(t) = P(t) - I_kn(t), I_kn(t) interpolation between P(k/n) and P((k+1)/n).
+// We can show that E_kn(t) = E(t) - [E(k/n)(1 - n(t-k/n)) + E((k+1)/n) n(t-k/n)]. I(t) simplifies out, and then we can apply the linear projection.
+// Using wolfram alpha to reduce and simplify the expression for avg_theta_kn^2, with v0 and v1 from before :
+// avg_theta_n^2 = [7n^2 (v0^2 - dot(v0, v1) + v1^2) - 5(v0 - v1)^2] / 210 n^6
+//
+// Finally we need to solve argmin_n avg_theta_n(n) <= error_target.
+// The polynom correctly models that an edge with inflexion would not benefit much from n=2 and only start to decrease for n=3 onwards.
+// Sadly non integer values do not make sense ; avg_theta_n(1.5) > max(avg_theta_n(1), avg_theta_n(2)).
+// Directly solving the polynomial is non-sensical (in addition to being hard for 3-rd degree).
+// Current strategy is to iterate on n=2^k until we find an ok value.
+// Due to the criterion being an error average, we may have to increase target precision ?
 
 // The current system uses angular size of D01 on the screen.
 // This has similar quality, is cheaper to compute, and singularity is only a point.
