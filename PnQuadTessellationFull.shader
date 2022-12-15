@@ -1,8 +1,6 @@
 ﻿// Goal : tessellate only to useful places : curved, on the side, large.
-// Use Phong to smooth geometry. Instead of triangles, use it on quads, it generates less artifacts.
+// Use PN quads to smooth geometry. Less artifacts than triangles.
 
-// TODO improve bezier computation with offsets to linear interpolation instead ?
-// TODO general optimization
 // TODO modularize to reuse pn in shadowcaster
 // TODO use real lighting, standard or something else
 
@@ -58,7 +56,7 @@
 // This has similar quality, is cheaper to compute, and singularity is only a point.
 // Angular precision is inferred to reach 1 pixel at screen center.
 
-Shader "Custom/PnQuadTessellation"
+Shader "Custom/PnQuadTessellationFull"
 {
     Properties {
         [Header (Standard Shader Parameters)]
